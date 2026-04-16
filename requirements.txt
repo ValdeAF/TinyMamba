@@ -1,0 +1,11 @@
+# Core Dependencies
+# torch is handled in Dockerfile via CPU index
+numpy>=1.24.0
+matplotlib>=3.7.0
+
+# Mamba/SSM specific
+einops>=0.7.0
+
+# Metrics & Utilities
+scipy>=1.10.0
+tqdm>=4.65.0

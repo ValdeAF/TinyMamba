@@ -1,0 +1,23 @@
+{
+    "name": "Mamba Gait Dev Environment",
+    "image": "mcr.microsoft.com/devcontainers/python:3.10-bullseye",
+    
+    "workspaceFolder": "/app",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/app,type=bind",
+
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylint",
+                "ms-vscode.cpptools"
+            ]
+        }
+    },
+
+    // 1. Install C tools via apt 
+    // 2. Install Python requirements via pip
+    "postCreateCommand": "sudo apt-get update && sudo apt-get install -y build-essential cmake && pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && pip install --no-cache-dir numpy matplotlib einops scipy tqdm",
+
+    "remoteUser": "vscode"
+}
