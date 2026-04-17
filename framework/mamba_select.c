@@ -26,7 +26,8 @@
 
 #include "mamba_select.h"
 
-#include <math.h>   /* expf, log1pf */
+#include <math.h>       /* expf, log1pf */
+#include "esp_dsp.h"   /* dsps_dotprod_f32 — ESP-DSP acceleration */
 
 /* =========================================================================
  * Internal helpers
@@ -90,11 +91,11 @@ void mamba_select_compute(const MambaSelectWeights *w,
         /* Read the bias from Flash — single scalar, always hot in cache. */
         float acc = w->b_delta[d];
 
-        /* Sequential read of row d of W_delta from Flash (cache-friendly). */
-        const float *row_d = w->W_delta[d];   /* pointer to W_delta[d][0] */
-        for (int k = 0; k < MAMBA_D; ++k) {
-            acc += row_d[k] * u[k];
-        }
+        /* dsps_dotprod_f32: hardware-accelerated dot product on Xtensa LX6/LX7.
+         * Computes acc += dot(W_delta[d], u) and adds the result to acc.  */
+        float dot_result = 0.0f;
+        dsps_dotprod_f32(w->W_delta[d], u, &dot_result, MAMBA_D);
+        acc += dot_result;
 
         /* softplus enforces Δ > 0, which is required for ZOH stability.   */
         out->delta[d] = softplus(acc);
@@ -108,10 +109,7 @@ void mamba_select_compute(const MambaSelectWeights *w,
      * ------------------------------------------------------------------ */
     for (int n = 0; n < MAMBA_N; ++n) {
         float acc = 0.0f;
-        const float *row_n = w->W_B[n];       /* pointer to W_B[n][0]     */
-        for (int k = 0; k < MAMBA_D; ++k) {
-            acc += row_n[k] * u[k];
-        }
+        dsps_dotprod_f32(w->W_B[n], u, &acc, MAMBA_D);
         out->B[n] = acc;
     }
 
@@ -122,10 +120,7 @@ void mamba_select_compute(const MambaSelectWeights *w,
      * ------------------------------------------------------------------ */
     for (int n = 0; n < MAMBA_N; ++n) {
         float acc = 0.0f;
-        const float *row_n = w->W_C[n];       /* pointer to W_C[n][0]     */
-        for (int k = 0; k < MAMBA_D; ++k) {
-            acc += row_n[k] * u[k];
-        }
+        dsps_dotprod_f32(w->W_C[n], u, &acc, MAMBA_D);
         out->C[n] = acc;
     }
 }

@@ -35,9 +35,9 @@
 static inline float softplus(float x)
 {
     if (x > 20.0f) return x;
-    /* log1p(y) = log(1 + y), more accurate than logf(1.0f + expf(x))
-     * when expf(x) is small.                                           */
-    return log1pf(expf(x));
+    /* logf(1 + expf(x)) — avoids the log1pf call overhead for the
+     * typical inference range where expf(x) >> 1e-5.                  */
+    return logf(1.0f + expf(x));
 }
 
 /**
@@ -69,9 +69,11 @@ void mamba_s6_state_reset(MambaS6State *state)
  * ---------------------------------------------------------------------- */
 void mamba_s6_params_init_default(MambaS6Params *params)
 {
-    /* Copy A and D_skip from the trained/mock weight constants in Flash */
-    memcpy(params->A, MAMBA_A, sizeof(params->A));
-    memcpy(params->D_skip, MAMBA_D_SKIP, sizeof(params->D_skip));
+    /* Copy A, D_skip, and out_bias from trained weight constants in Flash */
+    memcpy(params->A,        MAMBA_A,        sizeof(params->A));
+    memcpy(params->D_skip,   MAMBA_D_SKIP,   sizeof(params->D_skip));
+    memcpy(params->W_out,    MAMBA_W_OUT,    sizeof(params->W_out));
+    memcpy(params->bias_out, MAMBA_BIAS_OUT, sizeof(params->bias_out));
 
     /* Initialize deprecated per-channel projections to neutral values.
      * Note: mamba_s6_step_selective() ignores these in favor of
@@ -151,6 +153,7 @@ void mamba_s6_step_precomputed(const MambaS6Params *params,
      * a mutex, or heap-allocating in an init function.                    */
     float A_bar[MAMBA_N];
     float B_bar[MAMBA_N];
+    float y_internal[MAMBA_D];
 
     for (int d = 0; d < MAMBA_D; ++d) {
 
@@ -177,14 +180,24 @@ void mamba_s6_step_precomputed(const MambaS6Params *params,
         }
 
         /* ---- Step 3: Output projection ----------------------------------
-         *   y_d = Σ_n  C_in[d][n] · h_t[d][n]   +   D_skip[d] · x_d    */
+         *   y_d = Σ_n  C_in[d][n] · h_t[d][n]  +  D_skip[d] · x_d
+         *         + out_bias[d]                                           */
         float y_d = params->D_skip[d] * x_d;
 
         for (int n = 0; n < MAMBA_N; ++n) {
             y_d += C_in[d][n] * state->h[d][n];
         }
 
-        y_out[d] = y_d;
+        y_internal[d] = y_d;
+    }
+
+    /* ---- Step 4: Output projection (6x6 Readout Layer) -------------- */
+    for (int d = 0; d < MAMBA_D; ++d) {
+        float out_val = params->bias_out[d];
+        for (int i = 0; i < MAMBA_D; ++i) {
+            out_val += params->W_out[d][i] * y_internal[i];
+        }
+        y_out[d] = out_val;
     }
 }
 
@@ -263,6 +276,7 @@ void mamba_s6_step_selective(const MambaS6Params     *params,
 {
     float A_bar[MAMBA_N];
     float B_bar[MAMBA_N];
+    float y_internal[MAMBA_D];
 
     for (int d = 0; d < MAMBA_D; ++d) {
 
@@ -291,6 +305,32 @@ void mamba_s6_step_selective(const MambaS6Params     *params,
             y_d += sel->C[n] * state->h[d][n];
         }
 
-        y_out[d] = y_d;
+        y_internal[d] = y_d;
     }
+
+    /* ---- Step 4: 6x6 Dense Readout Layer --------------------------- */
+    for (int d = 0; d < MAMBA_D; ++d) {
+        float out_val = params->bias_out[d];
+        for (int i = 0; i < MAMBA_D; ++i) {
+            out_val += params->W_out[d][i] * y_internal[i];
+        }
+        y_out[d] = out_val;
+    }
+}
+
+/* =========================================================================
+ * Edge DPS Component: Over-The-Air Parameter Ingestion
+ * ========================================================================= */
+
+void mamba_update_readout_weights(MambaS6Params *params, 
+                                  const float new_W[MAMBA_D][MAMBA_D], 
+                                  const float new_bias[MAMBA_D])
+{
+    /* In a true Dual Prediction Scheme, the Edge Node (ESP32) skips running
+     * complex Kalman/RLS inversion algorithms locally. Instead, the Gateway runs 
+     * the compute-heavy optimization logic and transmits ONLY the tiny updated 
+     * 6x6 readout layer payload. The Node just writes it in.
+     */
+    memcpy(params->W_out,    new_W,    sizeof(params->W_out));
+    memcpy(params->bias_out, new_bias, sizeof(params->bias_out));
 }

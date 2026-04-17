@@ -60,7 +60,7 @@
 
 /** State dimension: size of the hidden state vector per channel. */
 #ifndef MAMBA_N
-#define MAMBA_N  32
+#define MAMBA_N  64
 #endif
 
 /* =========================================================================
@@ -98,6 +98,18 @@ typedef struct {
      * Shape: [D].  Applied as:  y += D_skip[d] * x[d].
      */
     float D_skip[MAMBA_D];
+
+    /**
+     * @brief DPS 6x6 Readout Layer weights.
+     * Shape: [D][D]. Multiplied against the inner SSM outputs.
+     */
+    float W_out[MAMBA_D][MAMBA_D];
+
+    /**
+     * @brief Output bias added after the Readout Layer computation.
+     * Shape: [D].
+     */
+    float bias_out[MAMBA_D];
 
     /* -----------------------------------------------------------------
      * Simplified projection weights — used by mamba_s6_step() only.
@@ -149,6 +161,8 @@ typedef struct {
 /* Trained weights for the fixed parameters (usually stored in Flash) */
 extern const float MAMBA_A[MAMBA_D][MAMBA_N];
 extern const float MAMBA_D_SKIP[MAMBA_D];
+extern const float MAMBA_W_OUT[MAMBA_D][MAMBA_D];
+extern const float MAMBA_BIAS_OUT[MAMBA_D];
 
 /* Forward declaration — breaks the circular dependency between mamba_s6.h
  * and mamba_select.h.  The full definition (and typedef) lives in mamba_select.h.
@@ -280,6 +294,18 @@ void mamba_s6_step_selective(const MambaS6Params    *params,
                               const float             x[MAMBA_D],
                               const MambaSelectOutput *sel,
                               float                   y_out[MAMBA_D]);
+
+/**
+ * @brief Over-The-Air (OTA) Readout Updater for Dual Prediction Scheme.
+ * Retrieves updated weights computed by the powerful Gateway and injects them
+ * into the edge module's active parameters.
+ * @param params Pointer to mutable model parameters.
+ * @param new_W  Pointer to the new 6x6 Float Readout Weights (144 bytes).
+ * @param new_bias Pointer to the new 6-Float array (24 bytes).
+ */
+void mamba_update_readout_weights(MambaS6Params *params, 
+                                  const float new_W[MAMBA_D][MAMBA_D], 
+                                  const float new_bias[MAMBA_D]);
 
 #ifdef __cplusplus
 }
