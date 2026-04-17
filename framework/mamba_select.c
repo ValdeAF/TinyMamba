@@ -63,6 +63,10 @@ void mamba_select_weights_use_default(MambaSelectWeights *w)
     w->b_delta = MAMBA_B_DELTA;
     w->W_B     = MAMBA_W_B;
     w->W_C     = MAMBA_W_C;
+
+    w->scale_W_delta = MAMBA_SCALE_W_DELTA;
+    w->scale_W_B     = MAMBA_SCALE_W_B;
+    w->scale_W_C     = MAMBA_SCALE_W_C;
 }
 
 /* -------------------------------------------------------------------------
@@ -79,48 +83,66 @@ void mamba_select_compute(const MambaSelectWeights *w,
                           const float               u[MAMBA_D],
                           MambaSelectOutput        *out)
 {
-    /* ------------------------------------------------------------------
-     * 1. Delta projection:  W_delta[D][D] @ u[D]  +  b_delta[D]
-     *    then apply softplus element-wise.
-     *
-     * W_delta[d][:] is the d-th row of the weight matrix.
-     * The dot product with u gives the raw (pre-activation) delta for
-     * channel d.  Adding b_delta[d] (the bias) shifts the operating point.
-     * ------------------------------------------------------------------ */
+    /* Dynamic quantization of the input u into INT8 */
+    int8_t u_q[MAMBA_D];
+    float u_max = 0.0f;
     for (int d = 0; d < MAMBA_D; ++d) {
-        /* Read the bias from Flash — single scalar, always hot in cache. */
-        float acc = w->b_delta[d];
+        float abs_u = fabsf(u[d]);
+        if (abs_u > u_max) {
+            u_max = abs_u;
+        }
+    }
+    
+    float u_scale = 0.0f;
+    float u_scale_inv = 0.0f;
+    if (u_max > 0.0f) {
+        u_scale = u_max / 127.0f;
+        u_scale_inv = 127.0f / u_max;
+    }
+    
+    for (int d = 0; d < MAMBA_D; ++d) {
+        float val = u[d] * u_scale_inv;
+        int val_i = (int)roundf(val);
+        if (val_i > 127) val_i = 127;
+        if (val_i < -127) val_i = -127;
+        u_q[d] = (int8_t)val_i;
+    }
 
-        /* dsps_dotprod_f32: hardware-accelerated dot product on Xtensa LX6/LX7.
-         * Computes acc += dot(W_delta[d], u) and adds the result to acc.  */
-        float dot_result = 0.0f;
-        dsps_dotprod_f32(w->W_delta[d], u, &dot_result, MAMBA_D);
-        acc += dot_result;
-
-        /* softplus enforces Δ > 0, which is required for ZOH stability.   */
+    /* ------------------------------------------------------------------
+     * 1. Delta projection:  W_delta[D][D] @ u_q[D]  +  b_delta[D]
+     *    INT8 dot product loop, scaled back to float, then bias and softplus.
+     * ------------------------------------------------------------------ */
+    float delta_mult = w->scale_W_delta * u_scale;
+    for (int d = 0; d < MAMBA_D; ++d) {
+        int32_t acc_q = 0;
+        for (int k = 0; k < MAMBA_D; ++k) {
+            acc_q += (int32_t)w->W_delta[d][k] * u_q[k];
+        }
+        float acc = w->b_delta[d] + (float)acc_q * delta_mult;
         out->delta[d] = softplus(acc);
     }
 
     /* ------------------------------------------------------------------
-     * 2. B projection:  W_B[N][D] @ u[D]  →  B[N]
-     *
-     * B is SHARED across all D channels (see mamba_select.h for rationale).
-     * Row n of W_B projects the full D-dim input to the n-th state element.
+     * 2. B projection:  W_B[N][D] @ u_q[D]  →  B[N]
      * ------------------------------------------------------------------ */
+    float B_mult = w->scale_W_B * u_scale;
     for (int n = 0; n < MAMBA_N; ++n) {
-        float acc = 0.0f;
-        dsps_dotprod_f32(w->W_B[n], u, &acc, MAMBA_D);
-        out->B[n] = acc;
+        int32_t acc_q = 0;
+        for (int k = 0; k < MAMBA_D; ++k) {
+            acc_q += (int32_t)w->W_B[n][k] * u_q[k];
+        }
+        out->B[n] = (float)acc_q * B_mult;
     }
 
     /* ------------------------------------------------------------------
-     * 3. C projection:  W_C[N][D] @ u[D]  →  C[N]
-     *
-     * C is also SHARED across all D channels.
+     * 3. C projection:  W_C[N][D] @ u_q[D]  →  C[N]
      * ------------------------------------------------------------------ */
+    float C_mult = w->scale_W_C * u_scale;
     for (int n = 0; n < MAMBA_N; ++n) {
-        float acc = 0.0f;
-        dsps_dotprod_f32(w->W_C[n], u, &acc, MAMBA_D);
-        out->C[n] = acc;
+        int32_t acc_q = 0;
+        for (int k = 0; k < MAMBA_D; ++k) {
+            acc_q += (int32_t)w->W_C[n][k] * u_q[k];
+        }
+        out->C[n] = (float)acc_q * C_mult;
     }
 }

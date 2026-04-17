@@ -88,25 +88,29 @@ typedef struct {
      * pre-softplus timescale values.  One row per output channel.
      * Pointer to a 2-D const array in Flash.
      */
-    const float (*W_delta)[MAMBA_D];    /* points to float[MAMBA_D][MAMBA_D] */
+    const int8_t (*W_delta)[MAMBA_D];    /* points to int8_t[MAMBA_D][MAMBA_D] */
 
     /**
      * b_delta: [D] bias added before softplus.
-     * Often initialised to a small positive value so the initial Δ after
-     * softplus is meaningful (e.g., ≈ log(exp(1)-1) ≈ 0.541 → Δ ≈ 1).
      */
     const float *b_delta;               /* points to float[MAMBA_D]          */
 
     /**
      * W_B: [N][D] projection, maps D-dim input to N-dim shared B vector.
-     * One row per state dimension.
      */
-    const float (*W_B)[MAMBA_D];        /* points to float[MAMBA_N][MAMBA_D] */
+    const int8_t (*W_B)[MAMBA_D];        /* points to int8_t[MAMBA_N][MAMBA_D] */
 
     /**
      * W_C: [N][D] projection, maps D-dim input to N-dim shared C vector.
      */
-    const float (*W_C)[MAMBA_D];        /* points to float[MAMBA_N][MAMBA_D] */
+    const int8_t (*W_C)[MAMBA_D];        /* points to int8_t[MAMBA_N][MAMBA_D] */
+
+    /**
+     * Quantization scales for the INT8 weight arrays.
+     */
+    float scale_W_delta;
+    float scale_W_B;
+    float scale_W_C;
 
 } MambaSelectWeights;
 
@@ -142,10 +146,14 @@ typedef struct MambaSelectOutput {
  * -DMAMBA_N values as every other translation unit.  Add them to your
  * CMakeLists.txt target_compile_definitions() to ensure consistency.
  * ========================================================================= */
-extern const float MAMBA_W_DELTA[MAMBA_D][MAMBA_D];
+extern const int8_t MAMBA_W_DELTA[MAMBA_D][MAMBA_D];
 extern const float MAMBA_B_DELTA[MAMBA_D];
-extern const float MAMBA_W_B[MAMBA_N][MAMBA_D];
-extern const float MAMBA_W_C[MAMBA_N][MAMBA_D];
+extern const int8_t MAMBA_W_B[MAMBA_N][MAMBA_D];
+extern const int8_t MAMBA_W_C[MAMBA_N][MAMBA_D];
+
+extern const float MAMBA_SCALE_W_DELTA;
+extern const float MAMBA_SCALE_W_B;
+extern const float MAMBA_SCALE_W_C;
 
 /* =========================================================================
  * Public API

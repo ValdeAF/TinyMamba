@@ -156,13 +156,12 @@ class SimpleRNNModel(nn.Module):
 
 # 2. Data Loading & Preparation (HuGaDB)
 # ==========================================================
-def load_and_prepare_data(seq_len=64, data_dir="archiveIMU", max_samples=20000):
+def load_and_prepare_data(seq_len=64, data_dir="archiveIMU", max_samples=40000):
     """
     Loads raw IMU data from HuGaDB CSV files.
-    All HuGaDB files share the same 40-column structure, ensuring data consistency
-    across different subjects and trials.
+    Applies Leave-One-Subject-Out (LOSO) Cross-Validation:
+    Train: Subjects 1-15, Validation: Subjects 16-18.
     """
-    # Try different data directory locations to be robust across Docker/Local
     if not os.path.exists(data_dir):
         alt_dirs = ["../archiveIMU", "archiveIMU", "/app/archiveIMU"]
         for adir in alt_dirs:
@@ -176,18 +175,37 @@ def load_and_prepare_data(seq_len=64, data_dir="archiveIMU", max_samples=20000):
     if not files:
         raise FileNotFoundError(f"No CSV files found in {data_dir}")
 
-    # Normalize each file independently before concatenating.
-    # Gyro resting bias varies between subjects — global normalization maps each
-    # subject's bias to a different DC offset within [0,1], causing the constant
-    # prediction offset seen on low-variance gyro channels.
-    # Z-Score Normalization per file to handle heterogeneous sensor offsets
-    normalized_chunks = []
-    for file_name in files[:50]:
+    train_chunks = []
+    val_chunks = []
+    train_subjects_seen = {i: 0 for i in range(1, 16)}
+    val_subjects_seen = {i: 0 for i in range(16, 19)}
+    # Load up to 4 files per subject to ensure diversity across all 15 subjects
+    # without exceeding RAM limits.
+    MAX_FILES_PER_SUBJECT = 4 
+
+    for file_name in files:
+        parts = file_name.split('_')
+        if len(parts) >= 4:
+            try:
+                subject_id = int(parts[3])
+            except ValueError:
+                continue
+        else:
+            continue
+            
+        if subject_id in train_subjects_seen:
+            if train_subjects_seen[subject_id] >= MAX_FILES_PER_SUBJECT:
+                continue
+        elif subject_id in val_subjects_seen:
+            if val_subjects_seen[subject_id] >= MAX_FILES_PER_SUBJECT:
+                continue
+        else:
+            continue
+
         file_path = os.path.join(data_dir, file_name)
         file_rows = []
         with open(file_path, 'r') as f:
             reader = csv.reader(f)
-            # Skip header
             next(reader, None)
             for row in reader:
                 if not row or len(row) < 40: continue
@@ -199,36 +217,89 @@ def load_and_prepare_data(seq_len=64, data_dir="archiveIMU", max_samples=20000):
                     continue
         if len(file_rows) < seq_len + 2:
             continue
+            
         chunk = torch.tensor(file_rows, dtype=torch.float32)
-        # Z-Score: (x - mean) / std
+        # Z-Score Normalization per file to handle heterogeneous sensor offsets
         f_mean = chunk.mean(dim=0)
         f_std = chunk.std(dim=0)
-        f_std[f_std < 1e-4] = 1.0  # Avoid div zero
+        f_std[f_std < 1e-4] = 1.0
         chunk = (chunk - f_mean) / f_std
-        normalized_chunks.append(chunk)
+        
+        if subject_id in train_subjects_seen:
+            train_chunks.append(chunk)
+            train_subjects_seen[subject_id] += 1
+        elif subject_id in val_subjects_seen:
+            val_chunks.append(chunk)
+            val_subjects_seen[subject_id] += 1
 
-    data = torch.cat(normalized_chunks, dim=0)
-    train_size = int(0.8 * len(data))
+    if not train_chunks or not val_chunks:
+        raise ValueError("Not enough files matching subject IDs 1-15 (Train) and 16-18 (Val).")
+
+    train_data = torch.cat(train_chunks, dim=0)
+    val_data = torch.cat(val_chunks, dim=0)
     
     # Calculate global scaling constants for the export
-    data_mean = data[:train_size].mean(dim=0)
-    data_std = data[:train_size].std(dim=0)
-    print(f"Dataset prepared: {len(data)} samples ({len(normalized_chunks)} files, per-file normalized).")
+    data_mean = train_data.mean(dim=0)
+    data_std = train_data.std(dim=0)
+    print(f"Dataset prepared (LOSO split): Train files: {len(train_chunks)}, Val files: {len(val_chunks)}.")
 
-    n_samples = min(max_samples, len(data) - seq_len - 1)
-    x_seqs = torch.zeros((n_samples, seq_len, D), dtype=torch.float32)
-    y_target = torch.zeros((n_samples, seq_len, D), dtype=torch.float32)
+    # Evenly sample sequences to guarantee full subject distribution
+    valid_train_starts = len(train_data) - seq_len - 1
+    if valid_train_starts > max_samples:
+        train_indices = torch.linspace(0, valid_train_starts - 1, max_samples).long()
+    else:
+        train_indices = torch.arange(valid_train_starts)
 
-    for i in range(n_samples):
-        x_seqs[i] = data[i : i + seq_len, :]
-        y_target[i] = data[i + 1 : i + seq_len + 1, :]
+    n_train = len(train_indices)
+    x_train = torch.zeros((n_train, seq_len, D), dtype=torch.float32)
+    y_train = torch.zeros((n_train, seq_len, D), dtype=torch.float32)
 
-    return x_seqs, y_target, data, data_mean, data_std, train_size
+    for i, start_idx in enumerate(train_indices):
+        x_train[i] = train_data[start_idx : start_idx + seq_len, :]
+        y_train[i] = train_data[start_idx + 1 : start_idx + seq_len + 1, :]
+        
+    val_max_samples = max_samples // 4
+    valid_val_starts = len(val_data) - seq_len - 1
+    if valid_val_starts > val_max_samples:
+        val_indices = torch.linspace(0, valid_val_starts - 1, val_max_samples).long()
+    else:
+        val_indices = torch.arange(valid_val_starts)
+
+    n_val = len(val_indices)
+    x_val = torch.zeros((n_val, seq_len, D), dtype=torch.float32)
+    y_val = torch.zeros((n_val, seq_len, D), dtype=torch.float32)
+
+    for i, start_idx in enumerate(val_indices):
+        x_val[i] = val_data[start_idx : start_idx + seq_len, :]
+        y_val[i] = val_data[start_idx + 1 : start_idx + seq_len + 1, :]
+
+    return x_train, y_train, x_val, y_val, val_data, data_mean, data_std
 
 
 # ==========================================================
 # 3. Export to C Logic
 # ==========================================================
+def tensor_to_c_array_int8(tensor, name, scale_name):
+    scale = tensor.abs().max() / 127.0
+    int8_tensor = torch.round(tensor / scale).to(torch.int8)
+    
+    flat = int8_tensor.detach().flatten().tolist()
+    s_scale = f"const float {scale_name} = {scale.item():.8f}f;\n"
+    
+    if len(tensor.shape) == 1:
+        s = f"const int8_t {name}[{tensor.shape[0]}] = {{\n    "
+        s += ", ".join([str(v) for v in flat])
+        s += "\n};\n"
+        return s_scale + s
+    elif len(tensor.shape) == 2:
+        s = f"const int8_t {name}[{tensor.shape[0]}][{tensor.shape[1]}] = {{\n"
+        for i in range(tensor.shape[0]):
+            row = int8_tensor[i].detach().tolist()
+            s += "    { " + ", ".join([str(v) for v in row]) + " },\n"
+        s += "};\n"
+        return s_scale + s
+    return ""
+
 def tensor_to_c_array(tensor, name):
     flat = tensor.detach().flatten().tolist()
     if len(tensor.shape) == 1:
@@ -247,8 +318,13 @@ def tensor_to_c_array(tensor, name):
 
 def export_to_c(model, x_verify, y_verify, data_min, data_max):
     print(f"Exporting weights and test data to C files...")
+    
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    framework_dir = os.path.join(os.path.dirname(script_dir), "framework")
+    os.makedirs(framework_dir, exist_ok=True)
+    
     # Weights & Scaling
-    weight_file = "../framework/mamba_weights.c"
+    weight_file = os.path.join(framework_dir, "mamba_weights.c")
     with open(weight_file, "w") as f:
         f.write('/* Auto-generated true S6 weights and scaling from PyTorch */\n')
         # ------------------------------------------------------------------ #
@@ -268,10 +344,10 @@ def export_to_c(model, x_verify, y_verify, data_min, data_max):
         f.write(tensor_to_c_array(model.D_skip, "MAMBA_D_SKIP"))
         f.write(tensor_to_c_array(model.W_out.weight, "MAMBA_W_OUT"))
         f.write(tensor_to_c_array(model.W_out.bias, "MAMBA_BIAS_OUT"))
-        f.write(tensor_to_c_array(model.W_delta.weight, "MAMBA_W_DELTA"))
+        f.write(tensor_to_c_array_int8(model.W_delta.weight, "MAMBA_W_DELTA", "MAMBA_SCALE_W_DELTA"))
         f.write(tensor_to_c_array(model.W_delta.bias, "MAMBA_B_DELTA"))
-        f.write(tensor_to_c_array(model.W_B.weight, "MAMBA_W_B"))
-        f.write(tensor_to_c_array(model.W_C.weight, "MAMBA_W_C"))
+        f.write(tensor_to_c_array_int8(model.W_B.weight, "MAMBA_W_B", "MAMBA_SCALE_W_B"))
+        f.write(tensor_to_c_array_int8(model.W_C.weight, "MAMBA_W_C", "MAMBA_SCALE_W_C"))
         f.write("\n/* Z-Score Normalization Constants (HuGaDB Right Foot Only) */\n")
         f.write(tensor_to_c_array(data_min, "MAMBA_X_MEAN"))
         f.write(tensor_to_c_array(data_max, "MAMBA_X_STD"))
@@ -292,6 +368,52 @@ def export_to_c(model, x_verify, y_verify, data_min, data_max):
             row = y_verify[i].detach().tolist()
             f.write("    { " + ", ".join([f"{v:.6f}f" for v in row]) + " },\n")
         f.write("};\n")
+
+def export_to_bin(model, x_verify, y_verify, data_min, data_max):
+    print(f"Exporting weights and test data to binary files...")
+    import struct
+    
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    framework_dir = os.path.join(os.path.dirname(script_dir), "framework")
+    os.makedirs(framework_dir, exist_ok=True)
+    
+    weight_file = os.path.join(framework_dir, "mamba_weights.bin")
+    with open(weight_file, "wb") as f:
+        # Header: Magic 'MAMB' followed by dimensions D and N as 32-bit unsigned ints
+        f.write(struct.pack('<4sII', b'MAMB', D, N))
+        
+        A_real = -torch.exp(model.A_log)
+        def write_tensor(t):
+            f.write(t.detach().cpu().numpy().astype(np.float32).tobytes())
+            
+        def write_tensor_int8(t):
+            scale = t.abs().max() / 127.0
+            int8_t = torch.round(t / scale).to(torch.int8)
+            # Write the floating point scale first, then the int8 array
+            f.write(scale.detach().cpu().numpy().astype(np.float32).tobytes())
+            f.write(int8_t.detach().cpu().numpy().astype(np.int8).tobytes())
+            
+        write_tensor(A_real)
+        write_tensor(model.D_skip)
+        write_tensor(model.W_out.weight)
+        write_tensor(model.W_out.bias)
+        write_tensor_int8(model.W_delta.weight)
+        write_tensor(model.W_delta.bias)
+        write_tensor_int8(model.W_B.weight)
+        write_tensor_int8(model.W_C.weight)
+        write_tensor(data_min)
+        write_tensor(data_max)
+
+    print(f"Binary weights exported to {weight_file}")
+    
+    # Test Data
+    data_file = "mamba_test_data.bin"
+    seq_len = x_verify.shape[0]
+    with open(data_file, "wb") as f:
+        # Header for test data: Magic 'TEST', seq_len, D
+        f.write(struct.pack('<4sII', b'TEST', seq_len, D))
+        f.write(x_verify.detach().cpu().numpy().astype(np.float32).tobytes())
+        f.write(y_verify.detach().cpu().numpy().astype(np.float32).tobytes())
 
 
 # ==========================================================
@@ -321,14 +443,13 @@ def exponential_smooth(tensor, alpha=0.85):
     return out
 
 
-def train_model(model, x_train, y_train, x_val, y_val, epochs=15, batch_size=32, model_path="mamba_gait_model.pt"):
+def train_model(model, x_train, y_train, x_val, y_val, epochs=15, batch_size=128, model_path="mamba_gait_model.pt"):
     print(f"Starting Training ({epochs} epochs, Batch Size: {batch_size})...")
-    optimizer = optim.AdamW(model.parameters(), lr=0.002, weight_decay=0.01)
+    optimizer = optim.AdamW(model.parameters(), lr=0.002, weight_decay=0.02)
     
-    # Stabilized OneCycleLR
+    # Smooth, strictly decreasing learning rate to prevent early stopping triggers during ramp-ups
     steps_per_epoch = (x_train.shape[0] + batch_size - 1) // batch_size
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.001, 
-                                             epochs=epochs, steps_per_epoch=steps_per_epoch)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs * steps_per_epoch, eta_min=1e-5)
     
     # ------------------------------------------------------------------
     # Exponential smoothing (EMA) on training targets, alpha=0.85.
@@ -337,7 +458,10 @@ def train_model(model, x_train, y_train, x_val, y_val, epochs=15, batch_size=32,
     # (which the model should NOT chase) are gently attenuated.
     # We smooth y but NOT x so the raw input signal is preserved.
     # ------------------------------------------------------------------
-    EMA_ALPHA = 0.85
+    # EMA Smoothing: Heavily dropping alpha to 0.70 acts as a low-pass filter.
+    # This forces Mamba to learn a "buttery smooth" trajectory (mimicking LSTM's tanh gates)
+    # rather than jumping erratically to catch raw sensor stochastic noise.
+    EMA_ALPHA = 0.70
     y_train_smooth = exponential_smooth(y_train, alpha=EMA_ALPHA)
     y_val_smooth   = exponential_smooth(y_val,   alpha=EMA_ALPHA)
     print(f"Target smoothing: EMA alpha={EMA_ALPHA} applied to y_train and y_val.")
@@ -370,8 +494,8 @@ def train_model(model, x_train, y_train, x_val, y_val, epochs=15, batch_size=32,
         # Bypassing torch.abs() to avoid division-by-zero gradient explosions on sqrt(0)
         spectral_loss = nn.functional.mse_loss(torch.view_as_real(fft_p), torch.view_as_real(fft_t))
 
-        # Re-weighted: Kinematic penalty reduced to prevent flattening of high-G accelerometer impacts!
-        return 4.0 * dps_mse + 1.0 * corr_loss + 0.5 * amp_loss + 0.1 * kinematic_loss + 0.2 * spectral_loss
+        # Balanced: Restoring gentle kinematic structural mapping.
+        return 4.0 * dps_mse + 2.0 * corr_loss + 1.0 * amp_loss + 0.1 * kinematic_loss + 0.1 * spectral_loss
 
     criterion = dps_phase_aware_loss
     
@@ -383,7 +507,7 @@ def train_model(model, x_train, y_train, x_val, y_val, epochs=15, batch_size=32,
         model.train()
         epoch_loss = 0.0
         
-        # Teacher forcing ratio decays from 1.0 down to 0.85 to introduce gentle scheduled sampling
+        # Teacher forcing decays gently to 0.85 to maintain phase locking
         tf_ratio = 1.0 - (0.15 * (epoch / max(1, epochs - 1)))
         
         # Simple manual progress bar
@@ -393,12 +517,14 @@ def train_model(model, x_train, y_train, x_val, y_val, epochs=15, batch_size=32,
             
             optimizer.zero_grad()
             
-            # Add small Gaussian noise to input for robustness
-            noise = torch.randn_like(x_batch) * 0.001
+            # Light noise for robustness. (Removed decoupled target scaling bug)
+            noise = torch.randn_like(x_batch) * 0.005
+            x_aug = x_batch + noise
+            
             if isinstance(model, TrueMambaS6Block):
-                outputs = model(x_batch + noise, teach_forcing_ratio=tf_ratio)
+                outputs = model(x_aug, teach_forcing_ratio=tf_ratio)
             else:
-                outputs = model(x_batch + noise)
+                outputs = model(x_aug)
             
             loss = criterion(outputs, y_batch_smooth)
             loss.backward()
@@ -432,17 +558,17 @@ def train_model(model, x_train, y_train, x_val, y_val, epochs=15, batch_size=32,
             print(f"Checkpoint! Best Val MSE: {best_val_loss:.5f}")
         else:
             patience_counter += 1
-            if patience_counter >= 6:
+            if patience_counter >= 15:
                 print(f"Early stopping triggered after {epoch+1} epochs.")
                 break
 
-def run_prediction(model, raw_data, train_size):
+def run_prediction(model, raw_data):
     print("Running prediction on validation sequence...")
     model.eval()
     with torch.no_grad():
         test_seq_len = 150
         warmup_len = 256  # Long warmup so hidden state is fully settled before scoring
-        val_start_idx = train_size + 500  # Skip past the first part of val set (often calm)
+        val_start_idx = 500  # Skip past the first part of val set (often calm)
         
         # Ensure we have enough data for warmup
         if val_start_idx < warmup_len:
@@ -490,8 +616,14 @@ def benchmark_model(model, input_dim=6, seq_len=1, iterations=100):
 
 def get_model_size(model):
     param_size = 0
-    for param in model.parameters():
-        param_size += param.nelement() * param.element_size()
+    for name, param in model.named_parameters():
+        # If the parameter is quantized on-device, calculate its footprint as 1 byte (INT8)
+        if hasattr(model, 'W_delta') and ('W_delta' in name or 'W_B' in name or 'W_C' in name) and 'bias' not in name:
+            param_size += param.nelement() * 1
+            param_size += 4 # Add the 4-byte scalar we created for the INT8 dequantization
+        else:
+            param_size += param.nelement() * param.element_size()
+            
     buffer_size = 0
     for buffer in model.buffers():
         buffer_size += buffer.nelement() * buffer.element_size()
@@ -564,9 +696,9 @@ if __name__ == "__main__":
     parser.add_argument('--train', action='store_true', help="Train the model")
     parser.add_argument('--predict', action='store_true', help="Run prediction/inference")
     parser.add_argument('--plot', action='store_true', help="Generate visualization plot")
-    parser.add_argument('--export', action='store_true', help="Export weights to C")
+    parser.add_argument('--export', type=str, choices=['c', 'bin'], help="Export weights format (c or bin)")
     parser.add_argument('--epochs', type=int, default=15)
-    parser.add_argument('--max_samples', type=int, default=20000, help="Max number of sequences to train on")
+    parser.add_argument('--max_samples', type=int, default=40000, help="Max number of sequences to train on")
     parser.add_argument('--model_path', type=str, default="mamba_gait_model.pt")
     args = parser.parse_args()
 
@@ -596,26 +728,30 @@ if __name__ == "__main__":
     if args.model_path == "mamba_gait_model.pt" and args.model != "mamba":
         args.model_path = f"{args.model}_gait_model.pt"
     
-    # Load data with user-specified max_samples
-    x_seqs, y_target, raw_data, d_min, d_max, raw_train_size = load_and_prepare_data(max_samples=args.max_samples)
-    train_size = int(0.8 * x_seqs.shape[0])  # sequence-level split for training
+    # Load data with user-specified max_samples and apply LOSO split
+    x_train, y_train, x_val, y_val, val_raw_data, d_min, d_max = load_and_prepare_data(max_samples=args.max_samples)
     
     if args.train:
-        x_train, y_train = x_seqs[:train_size], y_target[:train_size]
-        x_val, y_val = x_seqs[train_size:], y_target[train_size:]
         train_model(model, x_train, y_train, x_val, y_val, epochs=args.epochs, model_path=args.model_path)
     
+    # Ensure model path is found, whether running from project root or 'training' dir
+    if not os.path.exists(args.model_path):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        fallback_path = os.path.join(script_dir, os.path.basename(args.model_path))
+        if os.path.exists(fallback_path):
+            args.model_path = fallback_path
+
     # Load model if we are doing anything other than training (or in addition to training)
     if os.path.exists(args.model_path):
         print(f"Loading weights from {args.model_path}...")
         model.load_state_dict(torch.load(args.model_path, weights_only=True))
     elif not args.train:
-        print(f"Error: Model file {args.model_path} not found. Train it first with --train.")
+        print(f"Error: Model file '{args.model_path}' not found. Train it first with --train.")
         sys.exit(1)
 
     x_v, y_v, y_t = None, None, None
     if args.predict or args.plot or args.export:
-        x_v, y_v, y_t = run_prediction(model, raw_data, train_size)
+        x_v, y_v, y_t = run_prediction(model, val_raw_data)
         
         # Report Metrics
         size_kb = get_model_size(model)
@@ -645,6 +781,9 @@ if __name__ == "__main__":
         
     if args.export and y_v is not None:
         if args.model == 'mamba':
-            export_to_c(model, x_v, y_v, d_min, d_max)
+            if args.export == 'c':
+                export_to_c(model, x_v, y_v, d_min, d_max)
+            elif args.export == 'bin':
+                export_to_bin(model, x_v, y_v, d_min, d_max)
         else:
-            print("Warning: C export is only supported for Mamba models. Skipping export.")
+            print("Warning: Export is only supported for Mamba models. Skipping export.")
