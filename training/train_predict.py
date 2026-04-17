@@ -53,6 +53,9 @@ class TrueMambaS6Block(nn.Module):
         h = torch.zeros(batch, self.d, self.n, device=x.device)
         ys = []
         
+        if self.training:
+            self.state_decay_loss = torch.tensor(0.0, device=x.device)
+        
         y_prev = None
         for t in range(seq_len):
             x_t_true = x[:, t, :]
@@ -83,6 +86,9 @@ class TrueMambaS6Block(nn.Module):
             # --- 3. Hidden-state update ---
             x_t_b = x_t.unsqueeze(-1)
             h = A_bar * h + B_bar * x_t_b # [batch, D, N]
+            
+            if self.training:
+                self.state_decay_loss = self.state_decay_loss + torch.mean(h ** 2)
             
             # --- 4. Output projection ---
             C_t_b = C_t.unsqueeze(1) 
@@ -527,6 +533,17 @@ def train_model(model, x_train, y_train, x_val, y_val, epochs=15, batch_size=128
                 outputs = model(x_aug)
             
             loss = criterion(outputs, y_batch_smooth)
+            
+            # Extract L1 Sparsity penalty on the dense 6x6 Readout Layer to eliminate cross-talk hallucination
+            if hasattr(model, 'W_out'):
+                l1_penalty = 0.01 * torch.sum(torch.abs(model.W_out.weight))
+                loss += l1_penalty
+                
+            # State Decay Penalty: Forces Mamba to heavily dampen the memory buffer `h` after impact, eliminating overshoots
+            if hasattr(model, 'state_decay_loss'):
+                # Normalize by seq_len so it scales fairly, penalty weight set to 0.05
+                loss += 0.05 * (model.state_decay_loss / x_batch.shape[1])
+            
             loss.backward()
             
             # Gradient clipping for stability
