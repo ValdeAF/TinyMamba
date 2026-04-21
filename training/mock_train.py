@@ -90,7 +90,14 @@ def tensor_to_c_array(tensor, name):
         return s
     return ""
 
-with open("mamba_weights_mock.c", "w") as f:
+import os
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+ASSETS_DIR = os.path.join(PROJECT_ROOT, "assets")
+os.makedirs(ASSETS_DIR, exist_ok=True)
+
+weight_file = os.path.join(ASSETS_DIR, "mamba_weights_mock.c")
+with open(weight_file, "w") as f:
     f.write('/* Auto-generated mock weights from PyTorch */\n')
     f.write('#include "mamba_s6.h"\n\n')
     
@@ -104,4 +111,4 @@ with open("mamba_weights_mock.c", "w") as f:
     f.write(tensor_to_c_array(model.W_B.weight, "MAMBA_W_B"))
     f.write(tensor_to_c_array(model.W_C.weight, "MAMBA_W_C"))
 
-print("Exported to mamba_weights_mock.c! You can copy-paste these arrays into your mamba_weights.c file.")
+print(f"Exported to {weight_file}! You can copy-paste these arrays into your mamba_weights.c file.")

@@ -6,10 +6,21 @@ import torch.nn as nn
 import torch.optim as optim
 import csv
 import numpy as np
+import struct
 
-# Constants
+# Constants & Paths
 D = 6
 N = 64  # Must match MAMBA_STATE_DIM in mamba_s6.h
+
+# Centralized paths
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+ASSETS_DIR = os.path.join(PROJECT_ROOT, "assets")
+FRAMEWORK_DIR = os.path.join(PROJECT_ROOT, "framework")
+
+# Ensure directories exist
+os.makedirs(ASSETS_DIR, exist_ok=True)
+os.makedirs(FRAMEWORK_DIR, exist_ok=True)
 
 # ==========================================================
 # 1. Model Architecture (Mirror to mamba_s6.c)
@@ -324,13 +335,8 @@ def tensor_to_c_array(tensor, name):
 
 def export_to_c(model, x_verify, y_verify, data_min, data_max):
     print(f"Exporting weights and test data to C files...")
-    
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    framework_dir = os.path.join(os.path.dirname(script_dir), "framework")
-    os.makedirs(framework_dir, exist_ok=True)
-    
     # Weights & Scaling
-    weight_file = os.path.join(framework_dir, "mamba_weights.c")
+    weight_file = os.path.join(ASSETS_DIR, "mamba_weights.c")
     with open(weight_file, "w") as f:
         f.write('/* Auto-generated true S6 weights and scaling from PyTorch */\n')
         # ------------------------------------------------------------------ #
@@ -359,7 +365,7 @@ def export_to_c(model, x_verify, y_verify, data_min, data_max):
         f.write(tensor_to_c_array(data_max, "MAMBA_X_STD"))
 
     # Test Data
-    data_file = "mamba_test_data.h"
+    data_file = os.path.join(ASSETS_DIR, "mamba_test_data.h")
     seq_len = x_verify.shape[0]
     with open(data_file, "w") as f:
         f.write('/* Auto-generated test sequences */\n')
@@ -377,13 +383,7 @@ def export_to_c(model, x_verify, y_verify, data_min, data_max):
 
 def export_to_bin(model, x_verify, y_verify, data_min, data_max):
     print(f"Exporting weights and test data to binary files...")
-    import struct
-    
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    framework_dir = os.path.join(os.path.dirname(script_dir), "framework")
-    os.makedirs(framework_dir, exist_ok=True)
-    
-    weight_file = os.path.join(framework_dir, "mamba_weights.bin")
+    weight_file = os.path.join(ASSETS_DIR, "mamba_weights.bin")
     with open(weight_file, "wb") as f:
         # Header: Magic 'MAMB' followed by dimensions D and N as 32-bit unsigned ints
         f.write(struct.pack('<4sII', b'MAMB', D, N))
@@ -413,7 +413,7 @@ def export_to_bin(model, x_verify, y_verify, data_min, data_max):
     print(f"Binary weights exported to {weight_file}")
     
     # Test Data
-    data_file = "mamba_test_data.bin"
+    data_file = os.path.join(ASSETS_DIR, "mamba_test_data.bin")
     seq_len = x_verify.shape[0]
     with open(data_file, "wb") as f:
         # Header for test data: Magic 'TEST', seq_len, D
@@ -716,12 +716,12 @@ if __name__ == "__main__":
     parser.add_argument('--export', type=str, choices=['c', 'bin'], help="Export weights format (c or bin)")
     parser.add_argument('--epochs', type=int, default=15)
     parser.add_argument('--max_samples', type=int, default=40000, help="Max number of sequences to train on")
-    parser.add_argument('--model_path', type=str, default="mamba_gait_model.pt")
+    parser.add_argument('--model_path', type=str, default=None, help="Path to save/load model")
     args = parser.parse_args()
 
-    # Set dynamic default path if not specified
-    if args.model_path == "mamba_gait_model.pt" and args.model == "gru":
-        args.model_path = "gru_gait_model.pt"
+    # Set dynamic default paths
+    if args.model_path is None:
+        args.model_path = os.path.join(ASSETS_DIR, f"{args.model}_gait_model.pt")
 
     # If no flags provided, show help
     if not any([args.train, args.predict, args.plot, args.export]):
@@ -741,9 +741,7 @@ if __name__ == "__main__":
         print("Using Simple RNN model architecture.")
         model = SimpleRNNModel(D)
     
-    # Set dynamic default path if not specified
-    if args.model_path == "mamba_gait_model.pt" and args.model != "mamba":
-        args.model_path = f"{args.model}_gait_model.pt"
+    # (Removed redundant path logic)
     
     # Load data with user-specified max_samples and apply LOSO split
     x_train, y_train, x_val, y_val, val_raw_data, d_min, d_max = load_and_prepare_data(max_samples=args.max_samples)
@@ -751,12 +749,7 @@ if __name__ == "__main__":
     if args.train:
         train_model(model, x_train, y_train, x_val, y_val, epochs=args.epochs, model_path=args.model_path)
     
-    # Ensure model path is found, whether running from project root or 'training' dir
-    if not os.path.exists(args.model_path):
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        fallback_path = os.path.join(script_dir, os.path.basename(args.model_path))
-        if os.path.exists(fallback_path):
-            args.model_path = fallback_path
+    # (Removed redundant path logic)
 
     # Load model if we are doing anything other than training (or in addition to training)
     if os.path.exists(args.model_path):
@@ -793,7 +786,7 @@ if __name__ == "__main__":
         print("------------------------\n")
 
     if args.plot and y_v is not None:
-        plot_name = f"{args.model}_validation_plot.png"
+        plot_name = os.path.join(ASSETS_DIR, f"{args.model}_validation_plot.png")
         generate_plot(y_v, y_t, filename=plot_name)
         
     if args.export and y_v is not None:
