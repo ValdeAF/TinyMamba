@@ -27,7 +27,9 @@
 #include "mamba_select.h"
 
 #include <math.h>       /* expf, log1pf */
-#include "esp_dsp.h"   /* dsps_dotprod_f32 — ESP-DSP acceleration */
+#ifdef __esp32__
+#include "esp_dsp.h"    /* dsps_dotprod_f32 — ESP-DSP acceleration */
+#endif
 
 /* =========================================================================
  * Internal helpers
